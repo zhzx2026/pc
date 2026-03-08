@@ -1,4 +1,4 @@
-name: Windows Cloud PC (RDP + Encrypted Backup)
+name: Windows Cloud PC (Cloudflare Tunnel + Encrypted Backup)
 
 on:
   workflow_dispatch:
@@ -27,8 +27,11 @@ jobs:
       - name: Validate secrets
         shell: pwsh
         run: |
-          if (-not $env:NGROK_AUTHTOKEN) {
-            throw "Missing secret: NGROK_AUTHTOKEN"
+          if (-not $env:CLOUDFLARE_TUNNEL_TOKEN) {
+            throw "Missing secret: CLOUDFLARE_TUNNEL_TOKEN"
+          }
+          if (-not $env:CLOUDFLARE_RDP_HOSTNAME) {
+            throw "Missing secret: CLOUDFLARE_RDP_HOSTNAME"
           }
           if (-not $env:RDP_PASSWORD) {
             throw "Missing secret: RDP_PASSWORD"
@@ -37,7 +40,8 @@ jobs:
             throw "Missing secret: ZIP_PASSWORD"
           }
         env:
-          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+          CLOUDFLARE_RDP_HOSTNAME: ${{ secrets.CLOUDFLARE_RDP_HOSTNAME }}
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
           ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
 
@@ -184,108 +188,55 @@ jobs:
 
           Write-Host 'RDP enabled for user: runneradmin'
 
-      - name: Download and start ngrok
+      - name: Download and start cloudflared tunnel
         shell: pwsh
         env:
-          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+          CLOUDFLARE_RDP_HOSTNAME: ${{ secrets.CLOUDFLARE_RDP_HOSTNAME }}
         run: |
           $ErrorActionPreference = 'Stop'
 
-          Invoke-WebRequest -Uri 'https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip' -OutFile "$env:RUNNER_TEMP\ngrok.zip"
-          Expand-Archive -Path "$env:RUNNER_TEMP\ngrok.zip" -DestinationPath "$env:RUNNER_TEMP\ngrok" -Force
+          $cloudflared = Join-Path $env:RUNNER_TEMP 'cloudflared.exe'
+          $logFile = Join-Path $env:RUNNER_TEMP 'cloudflared.log'
+          $clientPort = 13389
 
-          $ngrok = "$env:RUNNER_TEMP\ngrok\ngrok.exe"
-          & $ngrok config add-authtoken "$env:NGROK_AUTHTOKEN"
+          Invoke-WebRequest -Uri 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe' -OutFile $cloudflared
 
-          $stdoutLog = Join-Path $env:RUNNER_TEMP 'ngrok.stdout.log'
-          $stderrLog = Join-Path $env:RUNNER_TEMP 'ngrok.stderr.log'
           $proc = Start-Process `
-            -FilePath $ngrok `
-            -ArgumentList @('tcp', '3389', '--log', 'stdout', '--log-format', 'logfmt') `
-            -RedirectStandardOutput $stdoutLog `
-            -RedirectStandardError $stderrLog `
+            -FilePath $cloudflared `
+            -ArgumentList @('tunnel', '--no-autoupdate', '--loglevel', 'info', '--logfile', $logFile, 'run', '--token', $env:CLOUDFLARE_TUNNEL_TOKEN) `
             -WindowStyle Hidden `
             -PassThru
 
-          $tunnel = $null
-          $host = $null
-          $port = $null
-          for ($i = 0; $i -lt 60; $i++) {
-            Start-Sleep -Seconds 2
-            try {
-              $resp = Invoke-RestMethod -Uri 'http://127.0.0.1:4040/api/tunnels'
-              $tunnel = $resp.tunnels | Where-Object { $_.proto -eq 'tcp' } | Select-Object -First 1
-              if ($tunnel) { break }
-            } catch {
-            }
-
-            if (-not $host -or -not $port) {
-              $match = Select-String -Path $stdoutLog -Pattern 'url=tcp://(?<host>[^: ]+):(?<port>\d+)' -ErrorAction SilentlyContinue
-              if ($match) {
-                $last = $match | Select-Object -Last 1
-                $host = $last.Matches[0].Groups['host'].Value
-                $port = $last.Matches[0].Groups['port'].Value
-                break
-              }
-            }
-
+          for ($i = 0; $i -lt 20; $i++) {
+            Start-Sleep -Seconds 3
             if ($proc.HasExited) {
               break
             }
           }
 
-          if (-not $tunnel -and (Test-Path $stdoutLog)) {
-            $match = Select-String -Path $stdoutLog -Pattern 'url=tcp://(?<host>[^: ]+):(?<port>\d+)'
-            if ($match) {
-              $last = $match | Select-Object -Last 1
-              $host = $last.Matches[0].Groups['host'].Value
-              $port = $last.Matches[0].Groups['port'].Value
+          if ($proc.HasExited) {
+            Write-Host 'cloudflared log tail:'
+            if (Test-Path $logFile) {
+              Get-Content -Path $logFile -Tail 80 | ForEach-Object { Write-Host $_ }
             }
+            throw "cloudflared exited before the tunnel stabilized. Exit code: $($proc.ExitCode)"
           }
 
-          if ((-not $tunnel) -and (-not $host -or -not $port)) {
-            Write-Host 'ngrok stdout tail:'
-            if (Test-Path $stdoutLog) {
-              Get-Content -Path $stdoutLog -Tail 60 | ForEach-Object { Write-Host $_ }
-            }
-
-            Write-Host 'ngrok stderr tail:'
-            if (Test-Path $stderrLog) {
-              Get-Content -Path $stderrLog -Tail 60 | ForEach-Object { Write-Host $_ }
-            }
-
-            if ($proc.HasExited) {
-              throw "ngrok exited before a tunnel became available. Exit code: $($proc.ExitCode)"
-            }
-
-            throw 'Failed to get ngrok tunnel info from local API.'
-          }
-
-          if (-not $host -or -not $port) {
-            $publicUrl = $tunnel.public_url
-            $address = $publicUrl -replace '^tcp://', ''
-            $host, $port = $address -split ':'
-          }
-
-          if (-not $host -or -not $port) {
-            throw 'Unable to determine ngrok host and port.'
-          }
-
-          "RDP_HOST=$host" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "RDP_PORT=$port" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CLIENT_RDP_PORT=$clientPort" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
           Write-Host '==============================================='
           Write-Host 'MSTSC connection info'
-          Write-Host "Host: $host"
-          Write-Host "Port: $port"
+          Write-Host "Cloudflare hostname: $env:CLOUDFLARE_RDP_HOSTNAME"
           Write-Host 'User: runneradmin'
           if ($env:RDP_PASSWORD_MODE -eq 'derived-with-suffix') {
             Write-Host 'Pass: use your RDP_PASSWORD secret plus the fixed suffix -Aa1!'
           } else {
             Write-Host 'Pass: use your RDP_PASSWORD secret'
           }
+          Write-Host "Client-side command: cloudflared access rdp --hostname $env:CLOUDFLARE_RDP_HOSTNAME --url rdp://localhost:$clientPort"
+          Write-Host "MSTSC target after cloudflared starts on your PC: localhost:$clientPort"
           Write-Host 'Persistent data folder: D:\CloudPC'
-          Write-Host "Example: mstsc /v:$host`:$port"
           Write-Host '==============================================='
 
       - name: Keep RDP online before backup window
