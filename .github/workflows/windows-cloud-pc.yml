@@ -197,11 +197,22 @@ jobs:
           $ngrok = "$env:RUNNER_TEMP\ngrok\ngrok.exe"
           & $ngrok config add-authtoken "$env:NGROK_AUTHTOKEN"
 
-          Start-Process -FilePath $ngrok -ArgumentList 'tcp 3389 --log=stdout' -WindowStyle Hidden
+          $stdoutLog = Join-Path $env:RUNNER_TEMP 'ngrok.stdout.log'
+          $stderrLog = Join-Path $env:RUNNER_TEMP 'ngrok.stderr.log'
+          $proc = Start-Process `
+            -FilePath $ngrok `
+            -ArgumentList @('tcp', '3389', '--web-addr', '127.0.0.1:4040', '--log', 'stdout', '--log-format', 'logfmt') `
+            -RedirectStandardOutput $stdoutLog `
+            -RedirectStandardError $stderrLog `
+            -WindowStyle Hidden `
+            -PassThru
 
           $tunnel = $null
-          for ($i = 0; $i -lt 45; $i++) {
+          for ($i = 0; $i -lt 60; $i++) {
             Start-Sleep -Seconds 2
+            if ($proc.HasExited) {
+              break
+            }
             try {
               $resp = Invoke-RestMethod -Uri 'http://127.0.0.1:4040/api/tunnels'
               $tunnel = $resp.tunnels | Where-Object { $_.proto -eq 'tcp' } | Select-Object -First 1
@@ -210,16 +221,41 @@ jobs:
             }
           }
 
-          if (-not $tunnel) {
-            throw 'Failed to get ngrok tunnel info.'
+          if (-not $tunnel -and (Test-Path $stdoutLog)) {
+            $match = Select-String -Path $stdoutLog -Pattern 'url=tcp://(?<host>[^: ]+):(?<port>\d+)'
+            if ($match) {
+              $last = $match | Select-Object -Last 1
+              $host = $last.Matches[0].Groups['host'].Value
+              $port = $last.Matches[0].Groups['port'].Value
+            }
           }
 
-          $publicUrl = $tunnel.public_url
-          $address = $publicUrl -replace '^tcp://', ''
-          $host, $port = $address -split ':'
+          if ((-not $tunnel) -and (-not $host -or -not $port)) {
+            Write-Host 'ngrok stdout tail:'
+            if (Test-Path $stdoutLog) {
+              Get-Content -Path $stdoutLog -Tail 60 | ForEach-Object { Write-Host $_ }
+            }
+
+            Write-Host 'ngrok stderr tail:'
+            if (Test-Path $stderrLog) {
+              Get-Content -Path $stderrLog -Tail 60 | ForEach-Object { Write-Host $_ }
+            }
+
+            if ($proc.HasExited) {
+              throw "ngrok exited before a tunnel became available. Exit code: $($proc.ExitCode)"
+            }
+
+            throw 'Failed to get ngrok tunnel info from local API.'
+          }
 
           if (-not $host -or -not $port) {
-            throw "Unexpected tunnel URL: $publicUrl"
+            $publicUrl = $tunnel.public_url
+            $address = $publicUrl -replace '^tcp://', ''
+            $host, $port = $address -split ':'
+          }
+
+          if (-not $host -or -not $port) {
+            throw 'Unable to determine ngrok host and port.'
           }
 
           "RDP_HOST=$host" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
