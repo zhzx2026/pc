@@ -1,0 +1,226 @@
+name: Windows Cloud PC (RDP + Encrypted Backup)
+
+on:
+  workflow_dispatch:
+    inputs:
+      total_minutes:
+        description: "Total runtime in minutes (fixed upper bound: 300)"
+        required: false
+        default: "300"
+      backup_window_minutes:
+        description: "Final backup window in minutes"
+        required: false
+        default: "60"
+  schedule:
+    - cron: "0 */5 * * *"
+
+concurrency:
+  group: windows-cloud-pc
+  cancel-in-progress: false
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 330
+
+    steps:
+      - name: Validate secrets
+        shell: pwsh
+        run: |
+          if (-not $env:NGROK_AUTHTOKEN) {
+            throw "Missing secret: NGROK_AUTHTOKEN"
+          }
+          if (-not $env:RDP_PASSWORD) {
+            throw "Missing secret: RDP_PASSWORD"
+          }
+          if (-not $env:ZIP_PASSWORD) {
+            throw "Missing secret: ZIP_PASSWORD"
+          }
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
+
+      - name: Enable RDP and set password
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # Enable RDP service + firewall rules.
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+          # Set password for default Windows runner user.
+          net user runneradmin "$env:RDP_PASSWORD"
+
+          Write-Host "RDP enabled for user: runneradmin"
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+
+      - name: Download and start ngrok
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Invoke-WebRequest -Uri 'https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip' -OutFile "$env:RUNNER_TEMP\ngrok.zip"
+          Expand-Archive -Path "$env:RUNNER_TEMP\ngrok.zip" -DestinationPath "$env:RUNNER_TEMP\ngrok" -Force
+
+          $ngrok = "$env:RUNNER_TEMP\ngrok\ngrok.exe"
+          & $ngrok config add-authtoken "$env:NGROK_AUTHTOKEN"
+
+          Start-Process -FilePath $ngrok -ArgumentList 'tcp 3389 --log=stdout' -WindowStyle Hidden
+
+          $tunnel = $null
+          for ($i = 0; $i -lt 45; $i++) {
+            Start-Sleep -Seconds 2
+            try {
+              $resp = Invoke-RestMethod -Uri 'http://127.0.0.1:4040/api/tunnels'
+              $tunnel = $resp.tunnels | Where-Object { $_.proto -eq 'tcp' } | Select-Object -First 1
+              if ($tunnel) { break }
+            } catch {
+              # ngrok API may not be ready yet.
+            }
+          }
+
+          if (-not $tunnel) {
+            throw 'Failed to get ngrok tunnel info.'
+          }
+
+          $publicUrl = $tunnel.public_url
+          $address = $publicUrl -replace '^tcp://', ''
+          $host, $port = $address -split ':'
+
+          if (-not $host -or -not $port) {
+            throw "Unexpected tunnel URL: $publicUrl"
+          }
+
+          "RDP_HOST=$host" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RDP_PORT=$port" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          Write-Host "==============================================="
+          Write-Host "MSTSC connection info"
+          Write-Host "Host: $host"
+          Write-Host "Port: $port"
+          Write-Host "User: runneradmin"
+          Write-Host "Pass: (from secret RDP_PASSWORD)"
+          Write-Host "Example: mstsc /v:$host`:$port"
+          Write-Host "==============================================="
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+
+      - name: Keep RDP online before backup window
+        shell: pwsh
+        env:
+          TOTAL_MINUTES: ${{ github.event.inputs.total_minutes || '300' }}
+          BACKUP_WINDOW_MINUTES: ${{ github.event.inputs.backup_window_minutes || '60' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $total = 300
+          if ($env:TOTAL_MINUTES -and $env:TOTAL_MINUTES -match '^\d+$') {
+            $total = [Math]::Min([int]$env:TOTAL_MINUTES, 300)
+          }
+
+          $backupWindow = 60
+          if ($env:BACKUP_WINDOW_MINUTES -and $env:BACKUP_WINDOW_MINUTES -match '^\d+$') {
+            $backupWindow = [Math]::Min([int]$env:BACKUP_WINDOW_MINUTES, 60)
+          }
+
+          $interactive = [Math]::Max($total - $backupWindow, 0)
+          Write-Host "Interactive window: $interactive minute(s)."
+          for ($i = 1; $i -le $interactive; $i++) {
+            Start-Sleep -Seconds 60
+            if ($i % 10 -eq 0) {
+              Write-Host "Interactive alive: $i / $interactive minute(s)"
+            }
+          }
+
+      - name: Last hour backup (zip encrypted + split volume)
+        shell: pwsh
+        env:
+          BACKUP_WINDOW_MINUTES: ${{ github.event.inputs.backup_window_minutes || '60' }}
+          ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $backupWindow = 60
+          if ($env:BACKUP_WINDOW_MINUTES -and $env:BACKUP_WINDOW_MINUTES -match '^\d+$') {
+            $backupWindow = [Math]::Min([int]$env:BACKUP_WINDOW_MINUTES, 60)
+          }
+
+          $windowStart = Get-Date
+          $backupRoot = Join-Path $env:RUNNER_TEMP 'cloudpc-backup'
+          New-Item -Path $backupRoot -ItemType Directory -Force | Out-Null
+
+          $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+          $archiveBase = Join-Path $backupRoot "cloudpc-$timestamp.zip"
+          $listFile = Join-Path $backupRoot 'include.txt'
+
+          $sources = @(
+            'C:\Users\runneradmin',
+            'D:\a'
+          )
+          $existing = $sources | Where-Object { Test-Path $_ }
+          if (-not $existing -or $existing.Count -eq 0) {
+            throw 'No backup source path exists.'
+          }
+          $existing | Set-Content -Path $listFile -Encoding ascii
+
+          $sevenZip = @(
+            "$env:ProgramFiles\7-Zip\7z.exe",
+            'C:\Program Files\7-Zip\7z.exe'
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if (-not $sevenZip) {
+            throw '7z.exe not found on runner.'
+          }
+
+          Write-Host "Creating encrypted split zip from:"
+          $existing | ForEach-Object { Write-Host " - $_" }
+
+          $args = @(
+            'a',
+            '-tzip',
+            $archiveBase,
+            "@$listFile",
+            "-p$env:ZIP_PASSWORD",
+            '-mem=AES256',
+            '-v1900m',
+            '-mx=3'
+          )
+          & $sevenZip @args
+          if ($LASTEXITCODE -ne 0) {
+            throw "7z failed with code $LASTEXITCODE"
+          }
+
+          $parts = Get-ChildItem -Path "$archiveBase*" | Sort-Object Name
+          if (-not $parts -or $parts.Count -eq 0) {
+            throw 'No zip output generated.'
+          }
+
+          Write-Host 'Backup parts generated:'
+          $parts | ForEach-Object {
+            $mb = [Math]::Round($_.Length / 1MB, 2)
+            Write-Host " - $($_.Name) ($mb MB)"
+          }
+
+          "BACKUP_PATTERN=$archiveBase*" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          $elapsed = (Get-Date) - $windowStart
+          $remaining = [Math]::Max([int]([Math]::Ceiling($backupWindow - $elapsed.TotalMinutes)), 0)
+          Write-Host "Backup finished. Remaining in backup window: $remaining minute(s)."
+
+          for ($i = 1; $i -le $remaining; $i++) {
+            Start-Sleep -Seconds 60
+            if ($i % 10 -eq 0) {
+              Write-Host "Backup window alive: $i / $remaining minute(s)"
+            }
+          }
+
+      - name: Upload encrypted split backup
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudpc-backup-${{ github.run_id }}
+          path: ${{ env.BACKUP_PATTERN }}
+          retention-days: 30
