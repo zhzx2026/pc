@@ -201,23 +201,36 @@ jobs:
           $stderrLog = Join-Path $env:RUNNER_TEMP 'ngrok.stderr.log'
           $proc = Start-Process `
             -FilePath $ngrok `
-            -ArgumentList @('tcp', '3389', '--web-addr', '127.0.0.1:4040', '--log', 'stdout', '--log-format', 'logfmt') `
+            -ArgumentList @('tcp', '3389', '--log', 'stdout', '--log-format', 'logfmt') `
             -RedirectStandardOutput $stdoutLog `
             -RedirectStandardError $stderrLog `
             -WindowStyle Hidden `
             -PassThru
 
           $tunnel = $null
+          $host = $null
+          $port = $null
           for ($i = 0; $i -lt 60; $i++) {
             Start-Sleep -Seconds 2
-            if ($proc.HasExited) {
-              break
-            }
             try {
               $resp = Invoke-RestMethod -Uri 'http://127.0.0.1:4040/api/tunnels'
               $tunnel = $resp.tunnels | Where-Object { $_.proto -eq 'tcp' } | Select-Object -First 1
               if ($tunnel) { break }
             } catch {
+            }
+
+            if (-not $host -or -not $port) {
+              $match = Select-String -Path $stdoutLog -Pattern 'url=tcp://(?<host>[^: ]+):(?<port>\d+)' -ErrorAction SilentlyContinue
+              if ($match) {
+                $last = $match | Select-Object -Last 1
+                $host = $last.Matches[0].Groups['host'].Value
+                $port = $last.Matches[0].Groups['port'].Value
+                break
+              }
+            }
+
+            if ($proc.HasExited) {
+              break
             }
           }
 
